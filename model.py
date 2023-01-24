@@ -1,3 +1,14 @@
+ROOT = "C:\\Program Files\\jupyter-workspace\\wizardChess\\data\\"
+
+"""
+==========Example Usage==========
+seg = wizSegmenter(img_size=256)
+seg.define()
+seg.train(batch_size=6, epochs=50, lr=6e-3, weight_decay=1e-4)
+seg.curves()
+seg.sample()
+"""
+
 import os
 import sys
 import random
@@ -14,26 +25,38 @@ from albumentations.pytorch import ToTensorV2
 from IPython.display import clear_output
 
 class wizDataset(torch.utils.data.Dataset):
-    def __init__(self, root="C:\\Program Files\\jupyter-workspace\\wizardChess\\data\\", img_size=1072, transform=None):
+    def __init__(self, root=ROOT, img_size=1072):
         self.IMG_SIZE = img_size
-        self.transform = transform
+        self.transform = A.Compose(
+            [
+                A.Affine(p=0.5, scale=(0.95, 1.05)),
+                A.Resize(img_size, img_size),
+                A.VerticalFlip(p=0.15),
+                A.HorizontalFlip(p=0.15),
+                A.Affine(p=0.2, shear=(-5, 5)),
+                A.RGBShift(p=0.2, r_shift_limit=10, g_shift_limit=10, b_shift_limit=10),
+                A.RandomBrightnessContrast(p=0.2, brightness_limit=0.1, contrast_limit=0.1),
+                
+            ]
+        )
 
         imgs = []
         labels = []
         for i in os.listdir(root+"images"):
-            imgs += [root+"images\\"+i]
+            imgs += [root+"images\\"+i] #changed for colab
             labels += [root+"labels\\"+i.split(".")[0]+".png"]
         self.data = list(zip(imgs, labels))
         random.shuffle(self.data)
 
         class_counts = [0, 0]
-        for datapoint in self.data:
+        for datapoint in self.data[:len(self.data)//2]:
             label = io.imread(datapoint[1], as_gray=True)
             class_counts[0] += np.sum(label==0)
             class_counts[1] += np.sum(label>0)
 
-        self.class_weights = torch.tensor([class_counts[0]/class_counts[1]],
+        self.class_weights = torch.tensor([1-class_count/sum(class_counts) for class_count in class_counts],
                                           dtype=torch.float).to("cuda")
+        
     def __len__(self):
         return len(self.data)
     
@@ -41,8 +64,8 @@ class wizDataset(torch.utils.data.Dataset):
         image = io.imread(self.data[idx][0])
         #image = cv2.resize(image, (self.IMG_SIZE, self.IMG_SIZE))#.reshape(3, self.IMG_SIZE, self.IMG_SIZE)/255.0
         mask = io.imread(self.data[idx][1], cv2.IMREAD_UNCHANGED)#, as_gray=True)
-        #mask = cv2.resize(mask, (self.IMG_SIZE, self.IMG_SIZE))#.reshape(1, self.IMG_SIZE, self.IMG_SIZE)/255.0
-
+        #mask = cv2.resize(mask, (self.IMG_SIZE, self.IMG_SIZE))#.reshape(1, self.IMG_SIZE, self.IMG_SIZE)
+        
         if self.transform is not None:
             transformed = self.transform(image = image, mask = mask)
             image = transformed["image"]
@@ -50,9 +73,10 @@ class wizDataset(torch.utils.data.Dataset):
 
         mask[mask > 0] = 1
         image = image.reshape(3, self.IMG_SIZE, self.IMG_SIZE)/255.0
-        mask = mask.reshape(1, self.IMG_SIZE, self.IMG_SIZE)
+        #mask = mask.reshape(1, self.IMG_SIZE, self.IMG_SIZE)
+        mask = mask.reshape(self.IMG_SIZE, self.IMG_SIZE)
 
-        return torch.tensor(image, dtype = torch.float32).to("cuda"), torch.tensor(mask, dtype = torch.float32).to("cuda")
+        return torch.tensor(image, dtype = torch.float32).to("cuda"), torch.tensor(mask, dtype = torch.int64).to("cuda")
 
 class train_val_test_split(torch.utils.data.Dataset):
     def __init__(self, dataset, split = (.85, .1, .05), mode="train"):
@@ -148,7 +172,7 @@ class attentionSegmenter(nn.Module):  # U-Net model
         self.up3 = upBlock(in_channels=256, out_channels=128)
         self.up4 = upBlock(in_channels=128, out_channels=64)
 
-        self.outConv = nn.Conv2d(in_channels=64, out_channels=1, kernel_size=(1, 1), stride=1, padding='same')
+        self.outConv = nn.Conv2d(in_channels=64, out_channels=2, kernel_size=(1, 1), stride=1, padding='same')
 
     def forward(self, x):
         # downsampling
@@ -170,21 +194,8 @@ class attentionSegmenter(nn.Module):  # U-Net model
         
 class wizSegmenter:
     def __init__(self, root="C:\\Program Files\\jupyter-workspace\\wizardChess\\data\\",img_size=1072):
-        self.history = {"train_loss":[], "train_acc":[], "validation_loss":[], "validation_acc":[], "precision":[], "recall":[]}
+        self.history = {"train_loss":[], "train_acc":[], "validation_loss":[], "validation_acc":[], "precision":[], "recall":[], "lr":[]}
         self.dataset = wizDataset(root = root, img_size = img_size)
-        self.dataset.transform = A.Compose(
-            [
-                A.Affine(p=0.5, scale=(0.9, 1.1)),
-                A.Resize(img_size, img_size),
-                A.VerticalFlip(p=0.2),
-                A.HorizontalFlip(p=0.2),
-                A.Affine(p=0.3, shear=(-10, 10)),
-                A.RGBShift(p=0.5, r_shift_limit=25, g_shift_limit=25, b_shift_limit=25),
-                A.RandomBrightnessContrast(p=0.5, brightness_limit=0.15, contrast_limit=0.15),
-                
-            ]
-        )
-
 
         #self.train_data, self.val_data = train_test_split(self.dataset, test_size = 0.1, train_size = 0.9)
         self.train_data = train_val_test_split(self.dataset, split=(.9, .1, 0), mode = "train")
@@ -194,13 +205,19 @@ class wizSegmenter:
     
     def define(self):
         self.net = attentionSegmenter().to("cuda")
+
+    def get_lr(self, optimizer):
+      for param_group in optimizer.param_groups:
+        return param_group['lr']
         
-    def train(self, batch_size, epochs, lr):
+    def train(self, batch_size, epochs, lr, weight_decay):
         dataloader = torch.utils.data.DataLoader(self.train_data, batch_size=batch_size, shuffle=True)
         valdataloader = torch.utils.data.DataLoader(self.val_data, batch_size=batch_size, shuffle=True)
 
-        optimizer = torch.optim.Adam(params=self.net.parameters(), lr=lr)
-        loss_criterion = nn.BCEWithLogitsLoss(pos_weight = self.dataset.class_weights)
+        optimizer = torch.optim.AdamW(params=self.net.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, epochs=epochs,
+                                            steps_per_epoch=len(dataloader))
+        loss_criterion = nn.CrossEntropyLoss(weight=self.dataset.class_weights)
         
         for epoch in range(epochs):
             self.net.train()
@@ -214,14 +231,21 @@ class wizSegmenter:
                 loss = loss_criterion(outputs, batch[1])
                 loss_sum += loss.item()
                 
-                
                 # calculate accuracy
-                batch_metrics = (torch.sum(((nn.Sigmoid()(outputs) >= 0.5) * 1) == batch[1]).item(), torch.numel(outputs))
+                batch_metrics = (torch.sum(torch.argmax(outputs, dim=1) == batch[1]).item(), torch.numel(batch[1]))
                 metrics = [a + b for a, b in zip(metrics, batch_metrics)]
 
                 loss.backward()
                 optimizer.step()
-            print(f"loss: {loss_sum / len(dataloader)}\t accuracy:{metrics[0]/metrics[1]}")
+                optimizer.zero_grad()
+
+                self.history["lr"] += [self.get_lr(optimizer)]
+                scheduler.step()
+          
+            if (epoch+1) % 5 == 0:
+                clear_output(wait=True)
+
+            print(f"loss: {loss_sum / len(dataloader)}\t accuracy:{metrics[0]/metrics[1]}\t lr:" + str(float('%.2g' % self.history["lr"][-1])))
             self.history["train_loss"] += [loss_sum / len(dataloader)]
             self.history["train_acc"] += [metrics[0]/metrics[1]]
 
@@ -244,8 +268,8 @@ class wizSegmenter:
             self.history["validation_acc"] += [metrics[0]/metrics[1]]
             self.history["recall"] += [metrics[2]/metrics[3]]
             self.history["precision"] += [metrics[4]/metrics[5]]
-            if (epoch+1) % 5 == 0:
-                clear_output(wait=True)
+
+            self.sample()
 
     def evaluate(self, output, target):
         true_pos= 0
@@ -253,14 +277,14 @@ class wizSegmenter:
         false_pos = 0
         false_neg = 0
         
-        pred = 1 * (nn.Sigmoid()(output) >= 0.5)
-        pred = pred.reshape(-1)
-        expected = target.reshape(-1).long()
+        pred = torch.argmax(F.softmax(output, dim=1), dim=1)
+        # pred = pred.reshape(-1)
+        # expected = target.reshape(-1)
         
-        true_pos = torch.sum(pred * expected).item()
-        true_neg = torch.sum((pred==0) * (expected==0)).item()
-        false_pos = torch.sum(pred * (expected==0)).item()
-        false_neg = torch.sum((pred==0) * expected).item()
+        true_pos = torch.sum(pred * target).item()
+        true_neg = torch.sum((pred==0) * (target==0)).item()
+        false_pos = torch.sum(pred * (target==0)).item()
+        false_neg = torch.sum((pred==0) * target).item()
 
         return (true_pos + true_neg,
                 true_pos + true_neg + false_pos + false_neg, 
@@ -294,13 +318,19 @@ class wizSegmenter:
             plt.ylabel("Accuracy")
             plt.title("Validation Accuracy")
             plt.plot(self.history["validation_acc"], color="orange")
-            
+
             plt.figure(5)
+            plt.xlabel("Batches")
+            plt.ylabel("Learning Rate")
+            plt.title("lr over time")
+            plt.plot(self.history["lr"])
+            
+            plt.figure(6)
             plt.xlabel("Epochs")
             plt.title("Precision")
             plt.plot(self.history["precision"], color="green")
             
-            plt.figure(6)
+            plt.figure(7)
             plt.xlabel("Epochs")
             plt.title("Recall")
             plt.plot(self.history["recall"], color="red")
@@ -318,24 +348,28 @@ class wizSegmenter:
             plt.title("Train Accuracy (blue) & Val Accuracy (orange)")
             plt.plot(self.history["train_acc"]) #blue is training loss
             plt.plot(self.history["validation_acc"]) #orange is validation loss
-            
+
             plt.figure(3)
+            plt.xlabel("Batches")
+            plt.ylabel("Learning Rate")
+            plt.title("lr over time")
+            plt.plot(self.history["lr"])
+            
+            plt.figure(4)
             plt.xlabel("Epochs")
             plt.title("Precision (green) & Recall (red)")
             plt.plot(self.history["precision"], color="green")
             plt.plot(self.history["recall"], color="red")
-            
         plt.show()
     
     def sample(self):
         selection = random.randint(1,len(self.val_data)-1)
         selection = self.val_data[selection]
-        output = self.net(selection[0].unsqueeze(0)).squeeze(0).squeeze(0)
-        output = nn.Sigmoid()(output)
-        #output = 1 * (output >= 0.5)
+        output = self.net(selection[0].unsqueeze(0)).squeeze(0)
+        output = nn.Softmax(dim=0)(output)[1]
         plt.imshow(selection[0].reshape(self.dataset.IMG_SIZE, self.dataset.IMG_SIZE, 3).cpu().numpy())
         plt.show()
-        # plt.imshow(selection[1].squeeze(0).cpu().numpy())
+        # plt.imshow(selection[1].cpu().numpy(), cmap='seismic', vmax=1, vmin=0)
         # plt.show()
         plt.imshow(output.detach().cpu().numpy(), cmap='seismic', vmax=1, vmin=0)
         plt.show()
